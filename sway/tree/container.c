@@ -1266,6 +1266,207 @@ void container_fullscreen_disable(struct sway_container *con) {
 	}
 }
 
+static void set_maximized(struct sway_container *con, bool enable) {
+	if (!con->view) {
+		return;
+	}
+	if (con->view->impl->set_maximized) {
+		con->view->impl->set_maximized(con->view, enable);
+		if (con->view->foreign_toplevel) {
+			wlr_foreign_toplevel_handle_v1_set_fullscreen(
+				con->view->foreign_toplevel, enable);
+		}
+	}
+
+	if (!server.linux_dmabuf_v1 || !con->view->surface) {
+		return;
+	}
+	if (!enable) {
+		wlr_linux_dmabuf_v1_set_surface_feedback(server.linux_dmabuf_v1,
+			con->view->surface, NULL);
+		return;
+	}
+
+	if (!con->pending.workspace || !con->pending.workspace->output) {
+		return;
+	}
+
+	struct sway_output *output = con->pending.workspace->output;
+	struct wlr_output *wlr_output = output->wlr_output;
+
+	// TODO: add wlroots helpers for all of this stuff
+
+	const struct wlr_drm_format_set *renderer_formats =
+		wlr_renderer_get_dmabuf_texture_formats(server.renderer);
+	assert(renderer_formats);
+
+	int renderer_drm_fd = wlr_renderer_get_drm_fd(server.renderer);
+	int backend_drm_fd = wlr_backend_get_drm_fd(wlr_output->backend);
+	if (renderer_drm_fd < 0 || backend_drm_fd < 0) {
+		return;
+	}
+
+	dev_t render_dev, scanout_dev;
+	if (!devid_from_fd(renderer_drm_fd, &render_dev) ||
+			!devid_from_fd(backend_drm_fd, &scanout_dev)) {
+		return;
+	}
+
+	const struct wlr_drm_format_set *output_formats =
+		wlr_output_get_primary_formats(output->wlr_output,
+		WLR_BUFFER_CAP_DMABUF);
+	if (!output_formats) {
+		return;
+	}
+
+	struct wlr_drm_format_set scanout_formats = {0};
+	if (!wlr_drm_format_set_intersect(&scanout_formats,
+			output_formats, renderer_formats)) {
+		return;
+	}
+
+	struct wlr_linux_dmabuf_feedback_v1_tranche tranches[] = {
+		{
+			.target_device = scanout_dev,
+			.flags = ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT,
+			.formats = &scanout_formats,
+		},
+		{
+			.target_device = render_dev,
+			.formats = renderer_formats,
+		},
+	};
+
+	const struct wlr_linux_dmabuf_feedback_v1 feedback = {
+		.main_device = render_dev,
+		.tranches = tranches,
+		.tranches_len = sizeof(tranches) / sizeof(tranches[0]),
+	};
+	wlr_linux_dmabuf_v1_set_surface_feedback(server.linux_dmabuf_v1,
+		con->view->surface, &feedback);
+
+	wlr_drm_format_set_finish(&scanout_formats);
+}
+
+static void container_maximize_workspace(struct sway_container *con) {
+	if (!sway_assert(con->pending.fullscreen_mode == FULLSCREEN_NONE,
+				"Expected a non-fullscreen container")) {
+		return;
+	}
+	set_maximized(con, true);
+	con->pending.fullscreen_mode = FULLSCREEN_WORKSPACE;
+
+	con->saved_x = con->pending.x;
+	con->saved_y = con->pending.y;
+	con->saved_width = con->pending.width;
+	con->saved_height = con->pending.height;
+
+	if (con->pending.workspace) {
+		con->pending.workspace->fullscreen = con;
+		struct sway_seat *seat;
+		struct sway_workspace *focus_ws;
+		wl_list_for_each(seat, &server.input->seats, link) {
+			focus_ws = seat_get_focused_workspace(seat);
+			if (focus_ws == con->pending.workspace) {
+				seat_set_focus_container(seat, con);
+			} else {
+				struct sway_node *focus =
+					seat_get_focus_inactive(seat, &root->node);
+				seat_set_raw_focus(seat, &con->node);
+				seat_set_raw_focus(seat, focus);
+			}
+		}
+	}
+
+	container_end_mouse_operation(con);
+	ipc_event_window(con, "fullscreen_mode");
+}
+
+void container_maximize_disable(struct sway_container *con) {
+	if (!sway_assert(con->pending.fullscreen_mode != FULLSCREEN_NONE,
+				"Expected a fullscreen container")) {
+		return;
+	}
+	set_maximized(con, false);
+
+	if (container_is_floating(con)) {
+		con->pending.x = con->saved_x;
+		con->pending.y = con->saved_y;
+		con->pending.width = con->saved_width;
+		con->pending.height = con->saved_height;
+	}
+
+	if (con->pending.fullscreen_mode == FULLSCREEN_WORKSPACE) {
+		if (con->pending.workspace) {
+			con->pending.workspace->fullscreen = NULL;
+			if (container_is_floating(con)) {
+				struct sway_output *output =
+					container_floating_find_output(con);
+				if (con->pending.workspace->output != output) {
+					container_floating_move_to_center(con);
+				}
+			}
+		}
+	} else {
+		root->fullscreen_global = NULL;
+	}
+
+	// If the container was mapped as fullscreen and set as floating by
+	// criteria, it needs to be reinitialized as floating to get the proper
+	// size and location
+	if (container_is_floating(con) && (con->pending.width == 0 || con->pending.height == 0)) {
+		container_floating_resize_and_center(con);
+	}
+
+	con->pending.fullscreen_mode = FULLSCREEN_NONE;
+	container_end_mouse_operation(con);
+	ipc_event_window(con, "fullscreen_mode");
+
+	if (con->scratchpad) {
+		struct sway_seat *seat;
+		wl_list_for_each(seat, &server.input->seats, link) {
+			struct sway_container *focus = seat_get_focused_container(seat);
+			if (focus == con || container_has_ancestor(focus, con)) {
+				seat_set_focus(seat,
+						seat_get_focus_inactive(seat, &root->node));
+			}
+		}
+	}
+}
+
+void container_set_maximize(struct sway_container *con,
+		enum sway_fullscreen_mode mode) {
+	if (con->pending.fullscreen_mode == mode) {
+		return;
+	}
+
+	switch (mode) {
+	case FULLSCREEN_NONE:
+		container_maximize_disable(con);
+		break;
+	case FULLSCREEN_WORKSPACE:
+		if (root->fullscreen_global) {
+			container_maximize_disable(root->fullscreen_global);
+		}
+		if (con->pending.workspace && con->pending.workspace->fullscreen) {
+			container_maximize_disable(con->pending.workspace->fullscreen);
+		}
+		container_maximize_workspace(con);
+		break;
+	case FULLSCREEN_GLOBAL:
+		//TODO:
+		assert(false);
+		// if (root->fullscreen_global) {
+		// 	container_maximize_disable(root->fullscreen_global);
+		// }
+		// if (con->pending.fullscreen_mode == FULLSCREEN_WORKSPACE) {
+		// 	container_maximize_disable(con);
+		// }
+		// container_fullscreen_global(con);
+		// break;
+	}
+}
+
 void container_set_fullscreen(struct sway_container *con,
 		enum sway_fullscreen_mode mode) {
 	if (con->pending.fullscreen_mode == mode) {

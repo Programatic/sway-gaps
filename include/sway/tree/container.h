@@ -257,6 +257,10 @@ void container_end_mouse_operation(struct sway_container *container);
 void container_set_fullscreen(struct sway_container *con,
 		enum sway_fullscreen_mode mode);
 
+void container_set_maximize(struct sway_container *con,
+		enum sway_fullscreen_mode mode);
+
+
 /**
  * Convenience function.
  */
