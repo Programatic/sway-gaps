@@ -176,6 +176,12 @@ set|plus|minus|toggle <amount>
 *layout* default|splith|splitv|stacking|tabbed
 	Sets the layout mode of the focused container.
 
+	When using the _stacking_ layout, only the focused window in the container is
+	displayed, with the opened windows' list on the top of the container.
+
+	The _tabbed_ layout is similar to _stacking_, but the windows’ list is vertically
+	split.
+
 *layout* toggle [split|all]
 	Cycles the layout mode of the focused container though a preset list of
 	layouts. If no argument is given, then it cycles through stacking, tabbed
@@ -623,7 +629,7 @@ The default colors are:
 	This option determines what to do when a client requests window activation.
 	If set to _urgent_, the urgent state will be set for that window. If set to
 	_focus_, the window will become focused. If set to _smart_, the window will
-	become focused only if it is already visible, otherwise the urgent state 
+	become focused only if it is already visible, otherwise the urgent state
 	will be set. Default is _urgent_.
 
 *focus_wrapping* yes|no|force|workspace
